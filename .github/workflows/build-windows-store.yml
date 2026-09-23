@@ -49,6 +49,10 @@ env:
   USE_GITHUB_RELEASES: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_RELEASES || 'true' }}
   USE_GITHUB_ARTIFACTS: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_ARTIFACTS || 'false' }}
   USE_R2_UPLOAD: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_R2_UPLOAD || 'true' }}
+  # gh runs inside the checked-out PRIVATE source, so without this it resolves the repository
+  # from that checkout's remote (zenderock/udemie) and the release step 404s. Releases belong
+  # to this public runner repository.
+  GH_REPO: ${{ github.repository }}
   SOURCE_REF: ${{ inputs.SOURCE_REF }}
   RELEASE_TAG: ${{ inputs.RELEASE_TAG || inputs.SOURCE_REF }}
 
