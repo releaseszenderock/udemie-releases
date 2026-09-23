@@ -1,0 +1,85 @@
+name: R2 Release Cleanup
+
+# Manually-dispatched janitor for the release bucket. Deletes every desktop/<tag>/
+# prefix that is NOT in KEEP_PREFIXES. Defaults to a dry run: run once with
+# DRY_RUN=true, read the log, then re-run with DRY_RUN=false.
+#
+# KEEP rationale:
+# - v3.5.11-rebuild-3 : the Windows installer the site currently links.
+# - v3.5.11           : the Linux .deb the site currently links (the .deb was never
+#                       re-uploaded into the rebuild folders — LINUX_DEB_VERSION is
+#                       still APP_VERSION in udemie-website/lib/appVersion.ts).
+# - v3.6.0            : the release being rolled out.
+on:
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: 'List what would be deleted without deleting anything'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      KEEP_PREFIXES:
+        description: 'Space-separated desktop/<tag> folders to keep'
+        required: false
+        default: 'v3.5.11 v3.5.11-rebuild-3 v3.6.0'
+        type: string
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    # Same environment as the release uploads: the R2_* secrets live there.
+    environment: production
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      KEEP_PREFIXES: ${{ inputs.KEEP_PREFIXES }}
+      DRY_RUN: ${{ inputs.DRY_RUN }}
+    steps:
+      - name: Delete stale desktop/<tag> prefixes
+        run: |
+          set -euo pipefail
+          for name in R2_ACCOUNT_ID R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required. Set the R2_* environment secrets." && exit 1
+            fi
+          done
+
+          endpoint="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          prefixes=$(aws s3api list-objects-v2 \
+            --bucket "$R2_BUCKET" --prefix desktop/ --delimiter / \
+            --endpoint-url "$endpoint" \
+            --query 'CommonPrefixes[].Prefix' --output text)
+
+          if [ -z "$prefixes" ] || [ "$prefixes" = "None" ]; then
+            echo "No desktop/ prefixes found — nothing to do."
+            exit 0
+          fi
+
+          for prefix in $prefixes; do
+            tag=$(basename "$prefix")
+            keep=false
+            for kept in $KEEP_PREFIXES; do
+              [ "$tag" = "$kept" ] && keep=true
+            done
+
+            if [ "$keep" = true ]; then
+              echo "KEEP          $prefix"
+              continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "WOULD DELETE  $prefix"
+              aws s3 ls "s3://$R2_BUCKET/$prefix" --recursive --endpoint-url "$endpoint" | sed 's/^/    /'
+            else
+              echo "DELETE        $prefix"
+              aws s3 rm "s3://$R2_BUCKET/$prefix" --recursive --endpoint-url "$endpoint"
+            fi
+          done

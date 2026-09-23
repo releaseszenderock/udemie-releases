@@ -1,0 +1,328 @@
+name: Build Windows Store Package
+
+# Runs in the public releaseszenderock/udemie-releases repository, dispatched by hand
+# (release-ci/release.sh). Never triggered by a push or a pull request, so no fork can reach
+# the secrets. The source lives in release-ci/ of the private repo; sync with release-ci/sync.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      SOURCE_REF:
+        description: 'Tag, branch or commit of zenderock/udemie to build (e.g. v3.6.4)'
+        required: true
+        type: string
+      USE_GITHUB_RELEASES:
+        description: 'Publish build output to GitHub Releases'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      USE_GITHUB_ARTIFACTS:
+        description: 'Upload build output as GitHub Actions Artifacts'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      USE_R2_UPLOAD:
+        description: 'Upload build output to Cloudflare R2'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      RELEASE_TAG:
+        description: 'Release tag and R2 prefix; defaults to SOURCE_REF'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+# GitHub Releases is the default because the Actions artifact storage quota was hit.
+# Keep artifact uploads available for short-lived troubleshooting by enabling USE_GITHUB_ARTIFACTS.
+env:
+  USE_GITHUB_RELEASES: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_RELEASES || 'true' }}
+  USE_GITHUB_ARTIFACTS: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_ARTIFACTS || 'false' }}
+  USE_R2_UPLOAD: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_R2_UPLOAD || 'true' }}
+  SOURCE_REF: ${{ inputs.SOURCE_REF }}
+  RELEASE_TAG: ${{ inputs.RELEASE_TAG || inputs.SOURCE_REF }}
+
+jobs:
+  build-msix:
+    runs-on: windows-latest
+    # Required for the R2 upload: the R2_* secrets are scoped to this environment, not to
+    # the repository. Without it they resolve empty and the upload step fails the release.
+    environment: production
+    defaults:
+      run:
+        working-directory: ./udemie
+        
+    steps:
+      # The source is private; this repository only holds the workflows. A read-only deploy key
+      # scoped to zenderock/udemie fetches it. Credentials are not persisted into the checkout.
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: zenderock/udemie
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Show source ref
+        shell: pwsh
+        run: |
+          $sha = git rev-parse HEAD
+          "SOURCE_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Windows Store build source ref: $env:SOURCE_REF"
+          Write-Host "Windows Store build source sha: $sha"
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: udemie/package-lock.json
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Setup binaries
+        run: npm run setup-binaries
+        env:
+          # Authenticated calls to api.github.com are capped per repository; unauthenticated
+          # ones are capped per runner IP, which is shared with every other tenant.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify bundled media binaries before packaging
+        shell: pwsh
+        run: |
+          foreach ($exe in @("yt-dlp.exe", "ffmpeg.exe", "ffprobe.exe")) {
+            if (!(Test-Path -LiteralPath ".\bin\$exe")) {
+              throw "Missing .\bin\$exe. Run npm run setup-binaries before packaging."
+            }
+          }
+          # ffmpeg is GPL: shipping the binary without its licence is a compliance breach.
+          if (!(Test-Path -LiteralPath ".\bin\FFMPEG-LICENSE.txt")) {
+            throw "Missing .\bin\FFMPEG-LICENSE.txt. See THIRD-PARTY-LICENSES.md."
+          }
+          # ffmpeg here is the shared build: without its sibling DLLs the exe cannot start,
+          # and the failure would only surface on a user's machine mid-download.
+          & ".\bin\ffmpeg.exe" -version | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Bundled ffmpeg.exe failed to run." }
+        
+      - name: Generate code signing certificate for MSIX
+        shell: pwsh
+        run: |
+          $publisher = node -e "const fs = require('fs'); const match = fs.readFileSync('forge.config.ts', 'utf8').match(/publisher:\s*'([^']+)'/); console.log(match ? match[1] : 'CN=Dummy');"
+          Write-Host "Generating code signing certificate for $publisher..."
+
+          $password = ConvertTo-SecureString -String "secret" -Force -AsPlainText
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject $publisher `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -HashAlgorithm SHA256 `
+            -KeyExportPolicy Exportable `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "Udemie AppX Signing" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @(
+              "2.5.29.37={text}1.3.6.1.5.5.7.3.3",
+              "2.5.29.19={text}false"
+            )
+
+          Export-PfxCertificate -Cert $cert -FilePath ".\devcert.pfx" -Password $password | Out-Null
+          Export-Certificate -Cert $cert -FilePath ".\devcert.cer" | Out-Null
+          Write-Host "Certificate thumbprint: $($cert.Thumbprint)"
+      
+      - name: Build MSIX package
+        run: npm run make -- --platform=win32
+        env:
+          # Ajoutez vos secrets si nécessaire
+          LICENSE_SECRET: ${{ secrets.LICENSE_SECRET }}
+      
+      - name: Validate Windows Store package
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Path ".\out\make\appx" -Filter "*.appx" -Recurse | Select-Object -First 1
+          if (-not $package) {
+            throw "No AppX package was generated."
+          }
+
+          .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName
+
+      - name: Inspect AppX signature
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Path ".\out\make\appx" -Filter "*.appx" -Recurse | Select-Object -First 1
+          if (-not $package) {
+            throw "No AppX package was generated."
+          }
+
+          Get-AuthenticodeSignature -FilePath $package.FullName | Format-List
+
+      - name: Write AppX SHA256
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Path ".\out\make\appx" -Filter "*.appx" -Recurse | Select-Object -First 1
+          if (-not $package) {
+            throw "No AppX package was generated."
+          }
+
+          $hash = Get-FileHash -LiteralPath $package.FullName -Algorithm SHA256
+          $hash.Hash | Set-Content -LiteralPath "$($package.FullName).sha256"
+          Write-Host "AppX: $($package.FullName)"
+          Write-Host "SHA256: $($hash.Hash)"
+
+      - name: Write desktop installer SHA256
+        shell: pwsh
+        run: |
+          $installers = @()
+          $installers += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue
+          $installers += Get-ChildItem -Path ".\out\make\zip" -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue
+
+          if (-not $installers) {
+            throw "No desktop installer assets were generated. Expected Squirrel .exe or ZIP output."
+          }
+
+          foreach ($installer in $installers) {
+            $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+            $hash.Hash | Set-Content -LiteralPath "$($installer.FullName).sha256"
+            Write-Host "Desktop asset: $($installer.FullName)"
+            Write-Host "SHA256: $($hash.Hash)"
+          }
+
+      # The S3 API, not the dashboard: `aws s3 cp` switches to multipart above 8 MB on its
+      # own, so the dashboard's ~300 MB single-upload ceiling never applies here. R2 needs
+      # no Workers for this — Workers would in fact impose their own request size limits.
+      - name: Upload Windows assets to Cloudflare R2
+        if: env.USE_R2_UPLOAD == 'true'
+        shell: pwsh
+        run: |
+          foreach ($name in @("R2_ACCOUNT_ID", "R2_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")) {
+            if (-not [System.Environment]::GetEnvironmentVariable($name)) {
+              throw "$name is required to upload to R2. Set the R2_* repository secrets."
+            }
+          }
+
+          # Same key the GitHub Release uses, so an asset is findable by tag in both places.
+          if ($env:RELEASE_TAG) {
+            $prefix = $env:RELEASE_TAG
+          } else {
+            $prefix = "run-$($env:GITHUB_RUN_ID)"
+          }
+
+          $assets = @()
+          $assets += Get-ChildItem -Path ".\out\make\appx" -Filter "*.appx" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "*.nupkg" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "RELEASES" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\zip" -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make" -Filter "*.sha256" -Recurse -ErrorAction SilentlyContinue
+
+          if (-not $assets) {
+            throw "No Windows assets found to upload to R2."
+          }
+
+          $endpoint = "https://$($env:R2_ACCOUNT_ID).r2.cloudflarestorage.com"
+          foreach ($asset in $assets) {
+            # Forge names the Squirrel installer "udemie-<v> Setup.exe", with a space. GitHub
+            # substitutes a dot when it stores a release asset, which is the name the site has
+            # always linked to; uploading the raw name here would leave the two stores
+            # disagreeing and every Windows download URL needing %20. Match GitHub.
+            $key = "desktop/$prefix/$($asset.Name -replace ' ', '.')"
+            Write-Host "Uploading $($asset.Name) -> s3://$($env:R2_BUCKET)/$key"
+            aws s3 cp $asset.FullName "s3://$($env:R2_BUCKET)/$key" --endpoint-url $endpoint --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              throw "R2 upload failed for $($asset.Name)."
+            }
+          }
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 rejects the flexible checksums aws-cli >= 2.23 sends by default; without
+          # these two the upload fails on an opaque header error, not a credentials one.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Upload Windows build artifacts
+        if: env.USE_GITHUB_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: windows-release-assets
+          path: |
+            udemie/out/make/appx/**/*.appx
+            udemie/out/make/squirrel.windows/**/*.exe
+            udemie/out/make/squirrel.windows/**/*.nupkg
+            udemie/out/make/squirrel.windows/**/RELEASES
+            udemie/out/make/zip/**/*.zip
+            udemie/out/make/**/*.sha256
+            udemie/devcert.cer
+          retention-days: 1
+      
+      - name: Publish Windows assets to GitHub Release
+        if: env.USE_GITHUB_RELEASES == 'true'
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG) {
+            $tag = $env:RELEASE_TAG
+            $title = $env:RELEASE_TAG
+          } else {
+            $tag = "temp-build-${{ github.run_id }}"
+            $title = "Udemie Windows Build - Run ${{ github.run_id }}"
+          }
+
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $buildDate = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          @(
+            "Source ref: $env:SOURCE_REF"
+            "Source commit: $env:SOURCE_SHA"
+            "Workflow run number: $env:GITHUB_RUN_NUMBER"
+            "Build date: $buildDate"
+          ) | Set-Content -LiteralPath $notesPath
+
+          $assets = @()
+          $assets += Get-ChildItem -Path ".\out\make\appx" -Filter "*.appx" -Recurse
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "*.nupkg" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\squirrel.windows" -Filter "RELEASES" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make\zip" -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue
+          $assets += Get-ChildItem -Path ".\out\make" -Filter "*.sha256" -Recurse -ErrorAction SilentlyContinue
+
+          $certificate = Get-Item -LiteralPath ".\devcert.cer" -ErrorAction SilentlyContinue
+          if ($certificate) {
+            $assets += $certificate
+          }
+
+          if (-not $assets) {
+            throw "No release assets found. Expected AppX, EXE, ZIP, SHA256, or certificate outputs."
+          }
+
+          $assetPaths = $assets | ForEach-Object { $_.FullName }
+
+          $releaseExists = $false
+          try {
+            gh release view $tag *> $null
+            $releaseExists = $LASTEXITCODE -eq 0
+          } catch {
+            $releaseExists = $false
+          }
+
+          if ($releaseExists) {
+            gh release upload $tag @assetPaths --clobber
+          } else {
+            gh release create $tag @assetPaths --title $title --notes-file $notesPath --prerelease --target $env:GITHUB_SHA
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

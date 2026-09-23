@@ -1,0 +1,319 @@
+name: Build Linux Packages
+
+# Runs in the public releaseszenderock/udemie-releases repository, dispatched by hand
+# (release-ci/release.sh). Never triggered by a push or a pull request, so no fork can reach
+# the secrets. The source lives in release-ci/ of the private repo; sync with release-ci/sync.sh.
+on:
+  workflow_dispatch:
+    inputs:
+      SOURCE_REF:
+        description: 'Tag, branch or commit of zenderock/udemie to build (e.g. v3.6.4)'
+        required: true
+        type: string
+      USE_GITHUB_RELEASES:
+        description: 'Publish build output to GitHub Releases'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      USE_GITHUB_ARTIFACTS:
+        description: 'Upload build output as GitHub Actions Artifacts'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      USE_R2_UPLOAD:
+        description: 'Upload build output to Cloudflare R2'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      SNAP_RELEASE_CHANNEL:
+        description: 'Optional Snap Store channel to upload to'
+        required: false
+        default: 'none'
+        type: choice
+        options:
+          - 'none'
+          - 'edge'
+          - 'beta'
+          - 'candidate'
+          - 'stable'
+      RELEASE_TAG:
+        description: 'Release tag and R2 prefix; defaults to SOURCE_REF'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  USE_GITHUB_RELEASES: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_RELEASES || 'true' }}
+  USE_GITHUB_ARTIFACTS: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_GITHUB_ARTIFACTS || 'false' }}
+  USE_R2_UPLOAD: ${{ github.event_name == 'workflow_dispatch' && inputs.USE_R2_UPLOAD || 'true' }}
+  SNAP_RELEASE_CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.SNAP_RELEASE_CHANNEL || 'beta' }}
+  SOURCE_REF: ${{ inputs.SOURCE_REF }}
+  RELEASE_TAG: ${{ inputs.RELEASE_TAG || inputs.SOURCE_REF }}
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    environment: production
+    defaults:
+      run:
+        working-directory: ./udemie
+
+    steps:
+      # The source is private; this repository only holds the workflows. A read-only deploy key
+      # scoped to zenderock/udemie fetches it. Credentials are not persisted into the checkout.
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: zenderock/udemie
+          ref: ${{ inputs.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Show source ref
+        run: |
+          echo "SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "Linux build source ref: $SOURCE_REF"
+          echo "Linux build source sha: $(git rev-parse HEAD)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: udemie/package-lock.json
+
+      - name: Install Linux package prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fakeroot dpkg rpm libarchive-tools
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+          install_snap_with_retry() {
+            local name="$1"
+            shift
+            for attempt in 1 2 3; do
+              if sudo snap install "$name" "$@"; then
+                return 0
+              fi
+              echo "snap install $name failed on attempt $attempt; retrying..."
+              sudo snap changes || true
+              sleep 10
+            done
+            sudo snap install "$name" "$@"
+          }
+
+          install_snap_with_retry core22
+          if ! command -v snapcraft >/dev/null 2>&1; then
+            install_snap_with_retry snapcraft --classic
+          fi
+          snap list
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup binaries
+        run: npm run setup-binaries
+        env:
+          # Authenticated calls to api.github.com are capped per repository; unauthenticated
+          # ones are capped per runner IP, which is shared with every other tenant.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify bundled media binaries before packaging
+        run: |
+          test -x ./bin/yt-dlp
+          test -x ./bin/ffmpeg
+          test -x ./bin/ffprobe
+          ./bin/ffmpeg -version > /dev/null
+          # ffmpeg is GPL: shipping the binary without its licence is a compliance breach.
+          test -s ./bin/FFMPEG-LICENSE.txt
+          # Every Udemy request uses `--impersonate chrome`. A yt-dlp without curl_cffi still
+          # lists Chrome, marked "(unavailable)" — which is what the 3.6.3 Snap shipped (#12).
+          targets="$(./bin/yt-dlp --list-impersonate-targets)"
+          awk 'tolower($0) ~ /^[[:space:]]*chrome/ && tolower($0) !~ /unavailable/ { ok = 1 } END { exit !ok }' <<< "$targets" \
+            || { echo "$targets"; echo "::error::bundled yt-dlp cannot impersonate Chrome"; exit 1; }
+
+      - name: Run tests
+        run: npm test
+
+      - name: Type-check
+        run: npm exec tsc -- --noEmit
+
+      - name: Build DEB package
+        run: npm run make -- --platform=linux
+        env:
+          LICENSE_SECRET: ${{ secrets.LICENSE_SECRET }}
+
+      - name: Build Snap package
+        run: bash ./build-snap.sh
+        env:
+          SNAPCRAFT_ARGS: '--destructive-mode'
+
+      # #12: the host check above passed while the Snap failed, because a binary can behave
+      # differently once confined. Install the snap we just built and ask its own yt-dlp,
+      # inside the confinement users get, to start with the exact flags Udemy downloads use.
+      - name: Verify packaged Snap runtime (GPU, audio, Chrome impersonation)
+        run: |
+          shopt -s globstar nullglob
+          snaps=(out/make/snap/**/*.snap)
+          sudo snap install --dangerous "${snaps[0]}"
+          trap 'sudo snap remove --purge udemie || true' EXIT
+          # GPU and audio runtime. Without these the 3.6.3 Snap drew everything with
+          # SwiftShader (Mesa could not find its drivers) and had no sound (no libpulse).
+          snap run --shell udemie -c '
+            set -e
+            L="$SNAP/usr/lib/x86_64-linux-gnu"
+            test -e "$L/libpulse.so.0" || { echo "::error::snap lacks libpulse.so.0 (no audio)"; exit 1; }
+            ls "$L"/pulseaudio/libpulsecommon-*.so >/dev/null || { echo "::error::snap lacks libpulsecommon (no audio)"; exit 1; }
+            ls "$L"/dri/*_dri.so >/dev/null || { echo "::error::snap lacks Mesa DRI drivers (software rendering)"; exit 1; }
+            grep -q "LIBGL_DRIVERS_PATH=" "$SNAP/snap/local/launcher.sh" || { echo "::error::launcher does not point Mesa at its drivers"; exit 1; }
+            grep -q "PULSE_SERVER=" "$SNAP/snap/local/launcher.sh" || { echo "::error::launcher does not locate the PulseAudio socket"; exit 1; }
+          '
+          targets="$(snap run --shell udemie -c '"$SNAP/resources/bin/yt-dlp" --list-impersonate-targets')"
+          awk 'tolower($0) ~ /^[[:space:]]*chrome/ && tolower($0) !~ /unavailable/ { ok = 1 } END { exit !ok }' <<< "$targets" \
+            || { echo "$targets"; echo "::error::packaged Snap yt-dlp cannot impersonate Chrome"; exit 1; }
+          # yt-dlp rejects an unusable target before any network I/O, so this fails on the
+          # packaging defect even if the request itself is refused from a CI address.
+          output="$(snap run --shell udemie -c '"$SNAP/resources/bin/yt-dlp" --impersonate chrome --force-generic-extractor --skip-download --no-warnings -j https://www.udemy.com/robots.txt' 2>&1 || true)"
+          if grep -q 'Impersonate target' <<< "$output"; then
+            echo "$output"; echo "::error::packaged Snap yt-dlp rejected --impersonate chrome"; exit 1
+          fi
+
+      - name: Write Linux package SHA256
+        run: |
+          shopt -s globstar nullglob
+          assets=(out/make/deb/**/*.deb out/make/snap/**/*.snap)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No Linux package assets were generated."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            sha256sum "$asset" | awk '{print $1}' > "$asset.sha256"
+            echo "Asset: $asset"
+            echo "SHA256: $(cat "$asset.sha256")"
+          done
+
+      # The S3 API, not the dashboard: `aws s3 cp` switches to multipart above 8 MB on its
+      # own, so the dashboard's ~300 MB single-upload ceiling never applies here. R2 needs
+      # no Workers for this — Workers would in fact impose their own request size limits.
+      - name: Upload Linux assets to Cloudflare R2
+        if: env.USE_R2_UPLOAD == 'true'
+        run: |
+          set -euo pipefail
+
+          for name in R2_ACCOUNT_ID R2_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "$name is required to upload to R2. Set the R2_* repository secrets."
+              exit 1
+            fi
+          done
+
+          # Same key the GitHub Release uses, so an asset is findable by tag in both places.
+          if [ -n "$RELEASE_TAG" ]; then
+            prefix="$RELEASE_TAG"
+          else
+            prefix="run-${GITHUB_RUN_ID}"
+          fi
+
+          shopt -s globstar nullglob
+          assets=(out/make/deb/**/*.deb out/make/snap/**/*.snap out/make/**/*.sha256)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No Linux assets found to upload to R2."
+            exit 1
+          fi
+
+          for asset in "${assets[@]}"; do
+            # Spaces become dots, matching how GitHub stores a release asset. No Linux
+            # artefact carries one today; keeping both workflows on one rule is what stops
+            # that from becoming a difference nobody notices until a URL 404s.
+            key="desktop/$prefix/$(basename "$asset" | tr ' ' '.')"
+            echo "Uploading $asset -> s3://$R2_BUCKET/$key"
+            aws s3 cp "$asset" "s3://$R2_BUCKET/$key" \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+              --no-progress
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          # R2 rejects the flexible checksums aws-cli >= 2.23 sends by default; without
+          # these two the upload fails on an opaque header error, not a credentials one.
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Upload Linux build artifacts
+        if: env.USE_GITHUB_ARTIFACTS == 'true'
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: linux-release-assets
+          path: |
+            udemie/out/make/deb/**/*.deb
+            udemie/out/make/snap/**/*.snap
+            udemie/out/make/**/*.sha256
+          retention-days: 1
+
+      - name: Publish Linux assets to GitHub Release
+        if: env.USE_GITHUB_RELEASES == 'true'
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            tag="$RELEASE_TAG"
+            title="$RELEASE_TAG"
+          else
+            tag="temp-linux-build-${GITHUB_RUN_ID}"
+            title="Udemie Linux Build - Run ${GITHUB_RUN_ID}"
+          fi
+
+          notes_path="$RUNNER_TEMP/linux-release-notes.md"
+          {
+            echo "Source ref: $SOURCE_REF"
+            echo "Source commit: $SOURCE_SHA"
+            echo "Workflow run number: $GITHUB_RUN_NUMBER"
+            echo "Build date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$notes_path"
+
+          shopt -s globstar nullglob
+          assets=(out/make/deb/**/*.deb out/make/snap/**/*.snap out/make/**/*.sha256)
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No release assets found. Expected DEB, Snap, or SHA256 outputs."
+            exit 1
+          fi
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "$title" --notes-file "$notes_path" --prerelease --target "$GITHUB_SHA"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Snap to Snap Store
+        if: env.SNAP_RELEASE_CHANNEL != 'none'
+        run: |
+          if [ -z "${SNAPCRAFT_STORE_CREDENTIALS:-}" ]; then
+            echo "SNAPCRAFT_STORE_CREDENTIALS is required to upload to the Snap Store."
+            exit 1
+          fi
+          shopt -s globstar nullglob
+          snaps=(out/make/snap/**/*.snap)
+          if [ ${#snaps[@]} -ne 1 ]; then
+            echo "Expected exactly one snap package, found ${#snaps[@]}."
+            exit 1
+          fi
+          snapcraft upload "${snaps[0]}" --release="$SNAP_RELEASE_CHANNEL"
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
