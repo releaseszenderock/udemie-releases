@@ -145,6 +145,28 @@ jobs:
           Export-Certificate -Cert $cert -FilePath ".\devcert.cer" | Out-Null
           Write-Host "Certificate thumbprint: $($cert.Thumbprint)"
       
+      # Windows widgets (udemie/widgets/README.md): a C++/WinRT COM server built with the Windows
+      # App SDK, staged in ./widgets-provider where forge.config.ts picks it up (extraResource +
+      # the manifest's com:ExeServer and widget extension).
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Build Windows widget provider
+        shell: pwsh
+        run: |
+          nuget restore widgets\UdemieWidgets\packages.config -PackagesDirectory widgets\packages -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "NuGet restore for the widget provider failed." }
+          msbuild widgets\UdemieWidgets\UdemieWidgets.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "The widget provider did not build." }
+          $out = "widgets\UdemieWidgets\bin\x64\Release"
+          New-Item -ItemType Directory -Force -Path widgets-provider\templates | Out-Null
+          Copy-Item "$out\UdemieWidgets.exe" widgets-provider\
+          Copy-Item "$out\templates\*.json" widgets-provider\templates\
+          Get-ChildItem -Recurse widgets-provider | ForEach-Object { Write-Host "$($_.FullName) $($_.Length)" }
+
       - name: Build MSIX package
         run: npm run make -- --platform=win32
         env:
@@ -159,7 +181,7 @@ jobs:
             throw "No AppX package was generated."
           }
 
-          .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName
+          .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName -ExpectWidgets
 
       - name: Inspect AppX signature
         shell: pwsh
