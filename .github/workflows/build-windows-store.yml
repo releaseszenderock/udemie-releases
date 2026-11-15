@@ -167,6 +167,45 @@ jobs:
           Copy-Item "$out\templates\*.json" widgets-provider\templates\
           Get-ChildItem -Recurse widgets-provider | ForEach-Object { Write-Host "$($_.FullName) $($_.Length)" }
 
+      # Store helper (udemie/widgets/README.md, "Store helper"): the small executable that
+      # registers the re-engagement toast Windows shows while Udemie is closed, and switches the
+      # package's startup task. Staged in ./store-helper, where forge.config.ts picks it up
+      # (extraResource + the manifest's windows.startupTask).
+      #
+      # A failure here does not stop the release. The package is then built without the helper:
+      # no startup task in the manifest, and the app does without (no toast while closed, no
+      # start with Windows; everything else is unchanged). The next step says so loudly.
+      - name: Build Store helper
+        id: store_helper
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          nuget restore widgets\UdemieHelper\packages.config -PackagesDirectory widgets\packages -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "NuGet restore for the Store helper failed." }
+          msbuild widgets\UdemieHelper\UdemieHelper.vcxproj /p:Configuration=Release /p:Platform=x64 /m /nologo /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { throw "The Store helper did not build." }
+          New-Item -ItemType Directory -Force -Path store-helper | Out-Null
+          Copy-Item "widgets\UdemieHelper\bin\x64\Release\UdemieHelper.exe" store-helper\
+
+          # The runner has no package identity, so the helper must refuse and exit with code 2.
+          # This proves the executable starts at all (no missing DLL) before it is packaged.
+          $answerFile = Join-Path $env:RUNNER_TEMP "store-helper-answer.txt"
+          $probe = Start-Process -FilePath "store-helper\UdemieHelper.exe" -ArgumentList "status", "probe0001" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $answerFile
+          $answer = if (Test-Path -LiteralPath $answerFile) { Get-Content -LiteralPath $answerFile -Raw } else { "" }
+          Write-Host "Store helper outside a package: exit code $($probe.ExitCode), answer: $answer"
+          if ($probe.ExitCode -ne 2) { throw "The Store helper did not refuse to run outside a package (exit code $($probe.ExitCode))." }
+          Get-ChildItem store-helper | ForEach-Object { Write-Host "$($_.FullName) $($_.Length)" }
+
+      - name: Report a missing Store helper
+        if: steps.store_helper.outcome != 'success'
+        shell: pwsh
+        run: |
+          # Never package a helper that did not pass its own check.
+          Remove-Item -Recurse -Force store-helper -ErrorAction SilentlyContinue
+          $message = "The Store helper did not build or did not start. This package ships WITHOUT scheduled re-engagement toasts and WITHOUT start-with-Windows. See the 'Build Store helper' step."
+          Write-Host "::warning title=Store helper missing::$message"
+          "### Store helper missing`n`n$message" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
       - name: Build MSIX package
         run: npm run make -- --platform=win32
         env:
@@ -181,7 +220,12 @@ jobs:
             throw "No AppX package was generated."
           }
 
-          .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName -ExpectWidgets
+          # The helper is expected in the package exactly when it was built and staged above.
+          if (Test-Path -LiteralPath ".\store-helper\UdemieHelper.exe") {
+            .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName -ExpectWidgets -ExpectStoreHelper
+          } else {
+            .\scripts\validate-windows-store-package.ps1 -PackagePath $package.FullName -ExpectWidgets
+          }
 
       - name: Inspect AppX signature
         shell: pwsh
